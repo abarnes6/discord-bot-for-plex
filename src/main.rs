@@ -13,7 +13,7 @@ use serenity::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 async fn update_loop(
@@ -25,26 +25,33 @@ async fn update_loop(
     use serenity::all::CreateMessage;
     use tokio::sync::broadcast;
 
+    debug!("Starting update loop with {} Plex client(s)", plex_clients.len());
     let (aggregate_tx, mut aggregate_rx) = broadcast::channel::<()>(16);
 
-    for client in &plex_clients {
+    for (i, client) in plex_clients.iter().enumerate() {
         let mut rx = client.subscribe();
         let tx = aggregate_tx.clone();
         let cancel = cancel.clone();
+        debug!("Spawning update forwarder for client {}", i);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => {
+                        debug!("Update forwarder {} shutting down", i);
+                        break;
+                    }
                     result = rx.recv() => {
                         match result {
                             Ok(()) => {
+                                debug!("Forwarding update from client {}", i);
                                 let _ = tx.send(());
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                // Missed messages - just trigger an update anyway
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("Update forwarder {} lagged by {} messages", i, n);
                                 let _ = tx.send(());
                             }
                             Err(broadcast::error::RecvError::Closed) => {
+                                debug!("Update forwarder {} channel closed", i);
                                 break;
                             }
                         }
@@ -54,6 +61,7 @@ async fn update_loop(
         });
     }
 
+    debug!("Update loop ready, waiting for updates");
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -61,15 +69,26 @@ async fn update_loop(
                 break;
             }
             result = aggregate_rx.recv() => {
-                if result.is_err() {
-                    break;
+                match result {
+                    Ok(()) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Update loop lagged by {} messages, continuing", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("Aggregate channel closed");
+                        break;
+                    }
                 }
 
+                debug!("Received update notification");
                 let cfg = config.get().await;
 
                 let channel_id = match cfg.session_channel_id {
                     Some(c) => ChannelId::new(c),
-                    None => continue,
+                    None => {
+                        debug!("No session channel configured, skipping update");
+                        continue;
+                    }
                 };
 
                 let mut all_sessions = Vec::new();
@@ -79,25 +98,40 @@ async fn update_loop(
                     server_names.push(client.server_name().await);
                 }
 
-                let embeds = build_session_embeds(&all_sessions, &server_names);
+                debug!(
+                    "Collected {} session(s) from {} server(s)",
+                    all_sessions.len(),
+                    server_names.len()
+                );
 
+                let embeds = build_session_embeds(&all_sessions, &server_names);
+                debug!("Built {} embed(s)", embeds.len());
+
+                let start = std::time::Instant::now();
                 if let Some(msg_id) = cfg.session_message_id {
+                    debug!("Updating existing message {}", msg_id);
                     let edit = EditMessage::new().embeds(embeds);
-                    if let Err(e) = channel_id
+                    match channel_id
                         .edit_message(&http, MessageId::new(msg_id), edit)
                         .await
                     {
-                        error!("Failed to update session board: {}", e);
+                        Ok(_) => {
+                            debug!("Updated session board in {:?}", start.elapsed());
+                        }
+                        Err(e) => {
+                            error!("Failed to update session board after {:?}: {}", start.elapsed(), e);
+                        }
                     }
                 } else {
+                    debug!("Creating new session board message in channel {}", channel_id);
                     let msg = CreateMessage::new().embeds(embeds);
                     match channel_id.send_message(&http, msg).await {
                         Ok(message) => {
                             config.set_session_message(message.id.get()).await;
-                            info!("Created new session board message");
+                            info!("Created new session board message (ID: {}) in {:?}", message.id, start.elapsed());
                         }
                         Err(e) => {
-                            error!("Failed to create session message: {}", e);
+                            error!("Failed to create session message after {:?}: {}", start.elapsed(), e);
                         }
                     }
                 }
@@ -107,8 +141,10 @@ async fn update_loop(
 }
 
 async fn run_auth_flow(auth: &PlexAuth) -> Option<Vec<PlexServer>> {
+    debug!("Starting Plex auth flow");
     let (pin_id, code) = auth.request_pin().await?;
     let auth_url = auth.build_auth_url(&code);
+    debug!("Auth URL generated for pin {}", pin_id);
 
     println!();
     println!("════════════════════════════════════════════════════════════");
@@ -198,14 +234,22 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
+    info!("Initializing Plex Discord Bot");
+    debug!("Loading environment and config");
+
     let discord_token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
+    debug!("Discord token loaded");
+
     let config = Arc::new(ConfigManager::new().await);
+    debug!("Config manager initialized");
 
     let stored_servers = config.get_plex_servers().await;
     let plex_configs = if stored_servers.is_empty() {
+        debug!("No stored servers, starting auth flow");
         let auth = PlexAuth::new();
         match run_auth_flow(&auth).await {
             Some(servers) => {
+                debug!("Auth flow completed, saving {} server(s)", servers.len());
                 config.set_plex_servers(servers.clone()).await;
                 servers_to_configs(&servers)
             }
@@ -215,11 +259,14 @@ async fn main() {
             }
         }
     } else {
+        debug!("Found {} stored server(s)", stored_servers.len());
         servers_to_configs(&stored_servers)
     };
 
+    debug!("Creating {} PlexClient(s)", plex_configs.len());
     let mut plex_clients: Vec<Arc<PlexClient>> = Vec::new();
-    for plex_config in plex_configs {
+    for (i, plex_config) in plex_configs.into_iter().enumerate() {
+        debug!("Initializing Plex client {} (server: {})", i, plex_config.server_id);
         let client = Arc::new(PlexClient::new(plex_config));
         client.fetch_server_identity().await;
         plex_clients.push(client);
@@ -233,6 +280,7 @@ async fn main() {
     };
 
     let intents = GatewayIntents::GUILDS;
+    debug!("Creating Discord client with GUILDS intent");
 
     let mut client = Client::builder(&discord_token, intents)
         .event_handler(handler)
@@ -244,21 +292,25 @@ async fn main() {
 
     info!("Starting Plex Discord Bot");
 
+    debug!("Spawning {} SSE listener(s)", plex_clients.len());
     let mut sse_handles = Vec::new();
-    for plex_client in &plex_clients {
+    for (i, plex_client) in plex_clients.iter().enumerate() {
         let plex_sse = plex_client.clone();
         let cancel_sse = cancel.clone();
+        debug!("Spawning SSE listener {}", i);
         sse_handles.push(tokio::spawn(async move {
             plex_sse.start_sse_listener(cancel_sse).await;
         }));
     }
 
+    debug!("Spawning update loop");
     let config_update = config.clone();
     let cancel_update = cancel.clone();
     let update_handle = tokio::spawn(async move {
         update_loop(http, plex_clients, config_update, cancel_update).await;
     });
 
+    debug!("Starting Discord gateway connection");
     tokio::select! {
         result = client.start() => {
             if let Err(e) = result {
@@ -270,10 +322,14 @@ async fn main() {
         }
     }
 
+    debug!("Cancelling background tasks");
     cancel.cancel();
-    for handle in sse_handles {
+    debug!("Waiting for SSE listeners to stop");
+    for (i, handle) in sse_handles.into_iter().enumerate() {
+        debug!("Waiting for SSE listener {}", i);
         let _ = handle.await;
     }
+    debug!("Waiting for update loop to stop");
     let _ = update_handle.await;
     info!("Shutdown complete");
 }

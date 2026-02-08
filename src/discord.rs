@@ -7,7 +7,7 @@ use serenity::all::{
 };
 use serenity::async_trait;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub struct Handler {
     pub plex_clients: Vec<Arc<PlexClient>>,
@@ -16,6 +16,7 @@ pub struct Handler {
 
 impl Handler {
     async fn handle_set_channel(&self, command: &CommandInteraction) -> String {
+        debug!("Handling plex-channel command");
         let channel_id = command
             .data
             .options
@@ -25,38 +26,50 @@ impl Handler {
 
         match channel_id {
             Some(id) => {
+                debug!("Setting session channel to {}", id.get());
                 self.config.set_session_channel(id.get()).await;
                 self.trigger_all_updates().await;
                 format!("Session board will now be displayed in <#{}>", id.get())
             }
-            None => "Please specify a valid channel".to_string(),
+            None => {
+                debug!("No valid channel provided");
+                "Please specify a valid channel".to_string()
+            }
         }
     }
 
     async fn handle_refresh(&self) -> String {
+        debug!("Handling plex-refresh command");
         self.trigger_all_updates().await;
         "Session board refreshed".to_string()
     }
 
     async fn trigger_all_updates(&self) {
+        debug!("Triggering updates for {} Plex client(s)", self.plex_clients.len());
         for client in &self.plex_clients {
             client.trigger_update().await;
         }
     }
 
     async fn handle_clear(&self, ctx: &Context) -> String {
+        debug!("Handling plex-clear command");
         let cfg = self.config.get().await;
 
         let (channel_id, message_id) = match (cfg.session_channel_id, cfg.session_message_id) {
             (Some(c), Some(m)) => (c, m),
-            _ => return "No session board message to clear".to_string(),
+            _ => {
+                debug!("No session board message configured to clear");
+                return "No session board message to clear".to_string();
+            }
         };
 
+        debug!("Deleting message {} from channel {}", message_id, channel_id);
         let channel = ChannelId::new(channel_id);
         let message = MessageId::new(message_id);
 
         match channel.delete_message(&ctx.http, message).await {
             Ok(_) => {
+                debug!("Successfully deleted session board message");
                 self.config.clear_session().await;
                 "Session board cleared".to_string()
             }
@@ -72,7 +85,8 @@ impl Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("{} is connected!", ready.user.name);
+        info!("Discord bot connected as {}", ready.user.name);
+        debug!("Bot user ID: {}, guilds: {}", ready.user.id, ready.guilds.len());
 
         let commands = vec![
             CreateCommand::new("plex-channel")
@@ -92,6 +106,7 @@ impl EventHandler for Handler {
         ];
 
         for guild in &ready.guilds {
+            debug!("Registering commands for guild {}", guild.id);
             if let Err(e) = GuildId::new(guild.id.get())
                 .set_commands(&ctx.http, commands.clone())
                 .await
@@ -100,17 +115,27 @@ impl EventHandler for Handler {
             }
         }
 
-        info!("Slash commands registered");
+        info!("Slash commands registered for {} guild(s)", ready.guilds.len());
         self.trigger_all_updates().await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::Command(command) = interaction {
+            debug!(
+                "Received command: {} from user {} in guild {:?}",
+                command.data.name,
+                command.user.id,
+                command.guild_id
+            );
+
             let content = match command.data.name.as_str() {
                 "plex-channel" => self.handle_set_channel(&command).await,
                 "plex-refresh" => self.handle_refresh().await,
                 "plex-clear" => self.handle_clear(&ctx).await,
-                _ => "Unknown command".to_string(),
+                _ => {
+                    debug!("Unknown command received: {}", command.data.name);
+                    "Unknown command".to_string()
+                }
             };
 
             let data = CreateInteractionResponseMessage::new()
@@ -120,6 +145,8 @@ impl EventHandler for Handler {
 
             if let Err(e) = command.create_response(&ctx.http, builder).await {
                 error!("Failed to respond to command: {}", e);
+            } else {
+                debug!("Successfully responded to command: {}", command.data.name);
             }
         }
     }

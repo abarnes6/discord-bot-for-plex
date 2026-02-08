@@ -1,8 +1,16 @@
 use crate::plex::SessionMetadata;
 use serenity::builder::CreateEmbed;
+use tracing::debug;
 
 pub fn build_session_embeds(sessions: &[SessionMetadata], server_names: &[String]) -> Vec<CreateEmbed> {
+    debug!(
+        "Building embeds for {} session(s) across {} server(s)",
+        sessions.len(),
+        server_names.len()
+    );
+
     if sessions.is_empty() {
+        debug!("No active sessions, building empty state embed");
         let footer_text = if server_names.len() == 1 {
             server_names[0].clone()
         } else {
@@ -30,6 +38,11 @@ fn build_session_embed(session: &SessionMetadata) -> CreateEmbed {
         .as_ref()
         .map(|p| p.state.as_str())
         .unwrap_or("unknown");
+
+    debug!(
+        "Building embed: user={}, type={}, title={}, state={}",
+        user_name, session.media_type, session.title, player_state
+    );
 
     let description = match session.media_type.as_str() {
         "episode" => {

@@ -173,6 +173,7 @@ impl PlexAuth {
     }
 
     pub async fn request_pin(&self) -> Option<(u64, String)> {
+        debug!("Requesting auth pin from Plex");
         let url = format!("{}/pins?strong=true", PLEX_TV_API);
 
         let resp = self
@@ -186,10 +187,12 @@ impl PlexAuth {
             .ok()?;
 
         let pin: PinResponse = resp.json().await.ok()?;
+        debug!("Received pin ID: {}", pin.id);
         Some((pin.id, pin.code))
     }
 
     pub async fn check_pin(&self, pin_id: u64) -> Option<String> {
+        debug!("Checking pin status for ID: {}", pin_id);
         let url = format!("{}/pins/{}", PLEX_TV_API, pin_id);
 
         let resp = self
@@ -202,10 +205,14 @@ impl PlexAuth {
             .ok()?;
 
         let pin: PinResponse = resp.json().await.ok()?;
+        if pin.auth_token.is_some() {
+            debug!("Pin authenticated successfully");
+        }
         pin.auth_token
     }
 
     pub async fn get_servers(&self, token: &str) -> Vec<PlexResource> {
+        debug!("Fetching Plex servers from API");
         let url = format!("{}/resources", PLEX_TV_API);
 
         let resp = match self
@@ -219,15 +226,22 @@ impl PlexAuth {
             .await
         {
             Ok(r) => r,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                debug!("Failed to fetch servers: {}", e);
+                return Vec::new();
+            }
         };
 
-        resp.json::<Vec<PlexResource>>()
+        let servers: Vec<PlexResource> = resp
+            .json::<Vec<PlexResource>>()
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|r| r.provides.as_deref() == Some("server"))
-            .collect()
+            .collect();
+
+        debug!("Found {} Plex server(s)", servers.len());
+        servers
     }
 
     pub fn build_auth_url(&self, code: &str) -> String {
@@ -240,10 +254,14 @@ impl PlexAuth {
     }
 
     pub async fn get_server_urls(&self, token: &str, server_id: &str) -> Vec<String> {
+        debug!("Getting URLs for server: {}", server_id);
         let servers = self.get_servers(token).await;
         let server = match servers.into_iter().find(|s| s.client_identifier == server_id) {
             Some(s) => s,
-            None => return Vec::new(),
+            None => {
+                debug!("Server {} not found in resources", server_id);
+                return Vec::new();
+            }
         };
 
         let mut urls: Vec<String> = server
@@ -261,6 +279,7 @@ impl PlexAuth {
             .collect();
 
         urls.extend(local_urls);
+        debug!("Found {} URL(s) for server {}", urls.len(), server_id);
         urls
     }
 }
@@ -298,6 +317,7 @@ pub struct PlexClient {
 
 impl PlexClient {
     pub fn new(config: PlexConfig) -> Self {
+        debug!("Creating PlexClient for server: {}", config.server_id);
         let (update_tx, _) = broadcast::channel(16);
 
         let client = Client::builder()
@@ -333,6 +353,7 @@ impl PlexClient {
     }
 
     async fn try_url(&self, url: &str) -> bool {
+        debug!("Testing connection to: {}", url);
         let test_url = format!("{}/", url);
         match self
             .client
@@ -342,7 +363,10 @@ impl PlexClient {
             .send()
             .await
         {
-            Ok(_) => true,
+            Ok(resp) => {
+                debug!("Connection to {} succeeded (status: {})", url, resp.status());
+                true
+            }
             Err(e) => {
                 warn!("Connection error for {}: {}", url, e);
                 false
@@ -351,10 +375,15 @@ impl PlexClient {
     }
 
     pub async fn find_working_url(&self) -> Option<String> {
+        debug!("Finding working URL for server: {}", self.config.server_id);
+
         if let Some(url) = self.get_active_url().await {
+            debug!("Testing cached URL: {}", url);
             if self.try_url(&url).await {
+                debug!("Cached URL still working");
                 return Some(url);
             }
+            debug!("Cached URL no longer working, searching for new URL");
         }
 
         let urls = self
@@ -367,6 +396,7 @@ impl PlexClient {
             return None;
         }
 
+        debug!("Trying {} URL(s)", urls.len());
         for url in urls {
             info!("Trying Plex server at: {}", url);
             if self.try_url(&url).await {
@@ -385,6 +415,7 @@ impl PlexClient {
     }
 
     pub async fn trigger_update(&self) {
+        debug!("Manual update triggered for server: {}", self.server_name.read().await);
         self.update_sessions().await;
     }
 
@@ -427,6 +458,8 @@ impl PlexClient {
     pub async fn fetch_sessions(&self) -> Result<Vec<SessionMetadata>, reqwest::Error> {
         let base_url = self.get_active_url().await.unwrap_or_default();
         let url = format!("{}/status/sessions", base_url);
+        debug!("Fetching sessions from: {}", url);
+
         let response = self
             .client
             .get(&url)
@@ -438,18 +471,22 @@ impl PlexClient {
             .json::<SessionsResponse>()
             .await?;
 
+        debug!("Fetched {} session(s)", response.media_container.metadata.len());
         Ok(response.media_container.metadata)
     }
 
     async fn update_sessions(&self) {
+        debug!("Updating sessions");
         match self.fetch_sessions().await {
             Ok(mut sessions) => {
                 let server_name = self.server_name.read().await.clone();
+                debug!("Processing {} session(s) for {}", sessions.len(), server_name);
                 for session in &mut sessions {
                     session.server_name = server_name.clone();
                     self.enrich_artwork(session).await;
                 }
-                *self.sessions.write().await = sessions;
+                *self.sessions.write().await = sessions.clone();
+                debug!("Broadcasting update notification");
                 let _ = self.update_tx.send(());
             }
             Err(e) => {
@@ -459,15 +496,23 @@ impl PlexClient {
     }
 
     async fn enrich_artwork(&self, session: &mut SessionMetadata) {
+        debug!("Enriching artwork for: {}", session.title);
+
         let tmdb_id = match self.get_tmdb_id(session).await {
             Some(id) => id,
-            None => return,
+            None => {
+                debug!("No TMDB ID found for: {}", session.title);
+                return;
+            }
         };
 
         let media_path = match session.media_type.as_str() {
             "movie" => "movie",
             "episode" => "tv",
-            _ => return,
+            _ => {
+                debug!("Unsupported media type for artwork: {}", session.media_type);
+                return;
+            }
         };
 
         let cache_key = format!("{}:{}", media_path, tmdb_id);
@@ -477,13 +522,16 @@ impl PlexClient {
             let cache = self.artwork_cache.read().await;
             if let Some(entry) = cache.get(&cache_key) {
                 if entry.timestamp.elapsed().as_secs() < CACHE_TTL_SECS {
+                    debug!("Using cached artwork for: {}", session.title);
                     session.art_url = entry.value.clone();
                     return;
                 }
+                debug!("Cache expired for: {}", cache_key);
             }
         }
 
         // Fetch from TMDB
+        debug!("Fetching artwork from TMDB: {}/{}", media_path, tmdb_id);
         let art_url = self.fetch_tmdb_artwork(&tmdb_id, media_path).await;
 
         // Cache result
@@ -500,6 +548,8 @@ impl PlexClient {
 
         if let Some(ref url) = art_url {
             debug!("Got TMDB artwork: {}", url);
+        } else {
+            debug!("No artwork found for: {}", session.title);
         }
         session.art_url = art_url;
     }
@@ -508,6 +558,7 @@ impl PlexClient {
         // First try to extract from session GUIDs
         for guid in &session.guids {
             if let Some(id) = guid.id.strip_prefix("tmdb://") {
+                debug!("Found TMDB ID in session GUIDs: {}", id);
                 return Some(id.to_string());
             }
         }
@@ -515,6 +566,7 @@ impl PlexClient {
         // For episodes, fetch show metadata to get TMDB ID
         if session.media_type == "episode" {
             if let Some(ref gp_key) = session.grandparent_key {
+                debug!("Fetching TMDB ID from show metadata: {}", gp_key);
                 return self.fetch_tmdb_id_from_metadata(gp_key).await;
             }
         }
@@ -522,16 +574,20 @@ impl PlexClient {
         // For movies, try fetching from item metadata
         if session.media_type == "movie" {
             if let Some(ref key) = session.key {
+                debug!("Fetching TMDB ID from movie metadata: {}", key);
                 return self.fetch_tmdb_id_from_metadata(key).await;
             }
         }
 
+        debug!("No TMDB ID source available for: {}", session.title);
         None
     }
 
     async fn fetch_tmdb_id_from_metadata(&self, key: &str) -> Option<String> {
         let base_url = self.get_active_url().await?;
         let url = format!("{}{}", base_url, key);
+        debug!("Fetching metadata from: {}", url);
+
         let resp = self
             .client
             .get(&url)
@@ -547,15 +603,18 @@ impl PlexClient {
 
         for guid in &item.guids {
             if let Some(id) = guid.id.strip_prefix("tmdb://") {
+                debug!("Found TMDB ID in metadata: {}", id);
                 return Some(id.to_string());
             }
         }
 
+        debug!("No TMDB ID found in metadata for: {}", key);
         None
     }
 
     async fn fetch_tmdb_artwork(&self, tmdb_id: &str, media_path: &str) -> Option<String> {
         let endpoint = format!("{}/{}/{}/images", TMDB_API, media_path, tmdb_id);
+        debug!("Fetching TMDB images from: {}", endpoint);
 
         let resp: TmdbImagesResponse = self
             .client
@@ -568,6 +627,12 @@ impl PlexClient {
             .json()
             .await
             .ok()?;
+
+        debug!(
+            "TMDB response: {} poster(s), {} backdrop(s)",
+            resp.posters.len(),
+            resp.backdrops.len()
+        );
 
         resp.posters
             .first()
@@ -597,6 +662,7 @@ impl PlexClient {
             };
 
             let sse_url = format!("{}/:/eventsource/notifications?filters=playing", base_url);
+            debug!("Connecting SSE to: {}", sse_url);
 
             let request = self
                 .sse_client
@@ -606,7 +672,10 @@ impl PlexClient {
                 .header("X-Plex-Client-Identifier", APP_NAME);
 
             let mut es = match EventSource::new(request) {
-                Ok(es) => es,
+                Ok(es) => {
+                    debug!("EventSource created successfully");
+                    es
+                }
                 Err(e) => {
                     error!("Failed to create EventSource: {:?}", e);
                     *self.active_url.write().await = None;
@@ -623,6 +692,11 @@ impl PlexClient {
                         info!("SSE listener shutting down");
                         return;
                     }
+                    _ = tokio::time::sleep(Duration::from_secs(90)) => {
+                        warn!("SSE connection timeout - no events received");
+                        *self.active_url.write().await = None;
+                        break;
+                    }
                     event = es.next() => {
                         match event {
                             Some(Ok(Event::Open)) => {
@@ -638,6 +712,7 @@ impl PlexClient {
                                 break;
                             }
                             None => {
+                                debug!("SSE stream ended (None received)");
                                 *self.active_url.write().await = None;
                                 break;
                             }
